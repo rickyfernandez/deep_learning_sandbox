@@ -1,7 +1,14 @@
-import re
+import re, operator, sys, inspect
 import random
 from pathlib import Path
 from typing import Iterable, Any
+import itertools
+from typing import Iterable, Generator
+import numpy as np
+from numpy import array,ndarray
+from copy import copy
+from functools import partial
+from operator import itemgetter
 
 import torch
 from torch import optim
@@ -102,6 +109,249 @@ class SplitData:
     def __repr__(self):
         return f'{self.__class__.__name__}\nTrain: {self.train}\n\nValid: {self.valid}\n'
 
+class _Arg:
+    def __init__(self, i): self.i = i
+
+class bind:
+    "Same as `partial`, except you can use `arg0` `arg1` etc param placeholders"
+    def __init__(self, fn, *pargs, **pkwargs):
+        self.fn, self.pargs, self.pkwargs = fn, pargs, pkwargs
+        self.maxi = max((x.i for x in pargs if isinstance(x, _Arg)), default=-1)
+
+    def __call__(self, *args, **kwargs):
+        args = list(args)
+        kwargs = {**self.pkwargs,**kwargs}
+        for k,v in kwargs.items():
+            if isinstance(v,_Arg): kwargs[k] = args.pop(v.i)
+        fargs = [args[x.i] if isinstance(x, _Arg) else x for x in self.pargs] + args[self.maxi+1:]
+        return self.fn(*fargs, **kwargs)
+
+
+class FixSigMeta(type):
+    "A metaclass that fixes the signature on classes that override __new__"
+    def __new__(cls, name, bases, dict):
+        res = super().__new__(cls, name, bases, dict)
+        if res.__init__ is not object.__init__: res.__signature__ = inspect.signature(res.__init__)
+        return res
+
+class PrePostInitMeta(FixSigMeta):
+    "A metaclass that calls optional `__pre_init__` and `__post_init__` methods"
+    def __call__(cls, *args, **kwargs):
+        res = cls.__new__(cls)
+        if type(res)==cls:
+            if hasattr(res,'__pre_init__'): res.__pre_init__(*args,**kwargs)
+            res.__init__(*args,**kwargs)
+            if hasattr(res,'__post_init__'): res.__post_init__(*args,**kwargs)
+        return res
+
+# Cell
+class NewChkMeta(FixSigMeta):
+    "Metaclass to avoid recreating object passed to constructor"
+    def __call__(cls, x=None, *args, **kwargs):
+        if not args and not kwargs and x is not None and isinstance(x,cls):
+            x._newchk = 1
+            return x
+
+        res = super().__call__(*((x,) + args), **kwargs)
+        res._newchk = 0
+        return res
+
+class CollBase:
+    "Base class for composing a list of `items`"
+    def __init__(self, items): self.items = items
+    def __len__(self): return len(self.items)
+    def __getitem__(self, k): return self.items[k]
+    def __setitem__(self, k, v): self.items[list(k) if isinstance(k,CollBase) else k] = v
+    def __delitem__(self, i): del(self.items[i])
+    def __repr__(self): return self.items.__repr__()
+    def __iter__(self): return self.items.__iter__()
+
+def negate_func(f):
+    "Create new function that negates result of `f`"
+    def _f(*args, **kwargs): return not f(*args, **kwargs)
+    return _f
+
+
+def coll_repr(c, max_n=10):
+    "String repr of up to `max_n` items of (possibly lazy) collection `c`"
+    return f'(#{len(c)}) [' + ','.join(itertools.islice(map(repr,c), max_n)) + (
+        '...' if len(c)>10 else '') + ']'
+
+def zip_cycle(x, *args):
+    "Like `itertools.zip_longest` but `cycle`s through elements of all but first argument"
+    return zip(x, *map(cycle,args))
+
+def is_iter(o):
+    "Test whether `o` can be used in a `for` loop"
+    #Rank 0 tensors in PyTorch are not really iterable
+    return isinstance(o, (Iterable,Generator)) and getattr(o,'ndim',1)
+
+def is_coll(o):
+    "Test whether `o` is a collection (i.e. has a usable `len`)"
+    #Rank 0 tensors in PyTorch do not have working `len`
+    return hasattr(o, '__len__') and getattr(o,'ndim',1)
+
+def noop (x=None, *args, **kwargs):
+    "Do nothing"
+    return x
+
+def cycle(o):
+    "Like `itertools.cycle` except creates list of `None`s if `o` is empty"
+    o = _listify(o)
+    return itertools.cycle(o) if o is not None and len(o) > 0 else itertools.cycle([None])
+
+def _is_array(x): return hasattr(x,'__array__') or hasattr(x,'iloc')
+
+
+def is_indexer(idx):
+    "Test whether `idx` will index a single item in a list"
+    return isinstance(idx,int) or not getattr(idx,'ndim',1)
+
+def one_is_instance(a, b, t): return isinstance(a,t) or isinstance(b,t)
+
+def equals(a,b):
+    "Compares `a` and `b` for equality; supports sublists, tensors and arrays too"
+    if one_is_instance(a,b,type): return a==b
+    if hasattr(a, '__array_eq__'): return a.__array_eq__(b)
+    if hasattr(b, '__array_eq__'): return b.__array_eq__(a)
+    cmp = (np.array_equal if one_is_instance(a, b, ndarray       ) else
+           operator.eq    if one_is_instance(a, b, (str,dict,set)) else
+           all_equal      if is_iter(a) or is_iter(b) else
+           operator.eq)
+    return cmp(a,b)
+
+NoneType = type(None)
+
+def mask2idxs(mask):
+    "Convert bool mask or index list to index `L`"
+    if isinstance(mask,slice): return mask
+    mask = list(mask)
+    if len(mask)==0: return []
+    it = mask[0]
+    if hasattr(it,'item'): it = it.item()
+    if isinstance(it,(bool,NoneType,np.bool_)): return [i for i,m in enumerate(mask) if m]
+    return [int(i) for i in mask]
+
+def all_equal(a,b):
+    "Compares whether `a` and `b` are the same length and have the same contents"
+    if not is_iter(b): return False
+    return all(equals(a_,b_) for a_,b_ in itertools.zip_longest(a,b))
+
+def _listify(o):
+    if o is None: return []
+    if isinstance(o, list): return o
+    if isinstance(o, str) or _is_array(o): return [o]
+    if is_iter(o): return list(o)
+    return [o]
+
+class L(CollBase, metaclass=NewChkMeta):
+    "Behaves like a list of `items` but can also index with list of indices or masks"
+    _default='items'
+    def __init__(self, items=None, *rest, use_list=False, match=None):
+        if rest: items = (items,)+rest
+        if items is None: items = []
+        if (use_list is not None) or not _is_array(items):
+            items = list(items) if use_list else _listify(items)
+        if match is not None:
+            if is_coll(match): match = len(match)
+            if len(items)==1: items = items*match
+            else: assert len(items)==match, 'Match length mismatch'
+        super().__init__(items)
+
+    @property
+    def _xtra(self): return None
+    def _new(self, items, *args, **kwargs): return type(self)(items, *args, use_list=None, **kwargs)
+    def __getitem__(self, idx): return self._get(idx) if is_indexer(idx) else L(self._get(idx), use_list=None)
+    def copy(self): return self._new(self.items.copy())
+
+    def _get(self, i):
+        if is_indexer(i) or isinstance(i,slice): return getattr(self.items,'iloc',self.items)[i]
+        i = mask2idxs(i)
+        return (self.items.iloc[list(i)] if hasattr(self.items,'iloc')
+                else self.items.__array__()[(i,)] if hasattr(self.items,'__array__')
+                else [self.items[i_] for i_ in i])
+
+    def __setitem__(self, idx, o):
+        "Set `idx` (can be list of indices, or mask, or int) items to `o` (which is broadcast if not iterable)"
+        idx = idx if isinstance(idx,L) else _listify(idx)
+        if not is_iter(o): o = [o]*len(idx)
+        for i,o_ in zip(idx,o): self.items[i] = o_
+
+    def __iter__(self): return iter(self.items.itertuples() if hasattr(self.items,'iloc') else self.items)
+    def __contains__(self,b): return b in self.items
+    def __invert__(self): return self._new(not i for i in self)
+    def __eq__(self,b): return False if isinstance(b, (str,dict,set)) else all_equal(b,self)
+    def __repr__(self): return repr(self.items) if _is_array(self.items) else coll_repr(self)
+    def __mul__ (a,b): return a._new(a.items*b)
+    def __add__ (a,b): return a._new(a.items+_listify(b))
+    def __radd__(a,b): return a._new(b)+a
+    def __addi__(a,b):
+        a.items += list(b)
+        return a
+
+    def sorted(self, key=None, reverse=False):
+        if isinstance(key,str):   k=lambda o:getattr(o,key,0)
+        elif isinstance(key,int): k=itemgetter(key)
+        else: k=key
+        return self._new(sorted(self.items, key=k, reverse=reverse))
+
+    @classmethod
+    def split(cls, s, sep=None, maxsplit=-1): return cls(s.split(sep,maxsplit))
+
+    @classmethod
+    def range(cls, a, b=None, step=None):
+        if is_coll(a): a = len(a)
+        return cls(range(a,b,step) if step is not None else range(a,b) if b is not None else range(a))
+
+    def map(self, f, *args, **kwargs):
+        g = (bind(f,*args,**kwargs) if callable(f)
+             else f.format if isinstance(f,str)
+             else f.__getitem__)
+        return self._new(map(g, self))
+
+    def filter(self, f, negate=False, **kwargs):
+        if kwargs: f = partial(f,**kwargs)
+        if negate: f = negate_func(f)
+        return self._new(filter(f, self))
+
+    def argwhere(self, f, negate=False, **kwargs):
+        if kwargs: f = partial(f,**kwargs)
+        if negate: f = negate_func(f)
+        return self._new(i for i,o in enumerate(self) if f(o))
+
+    def unique(self): return L(dict.fromkeys(self).keys())
+    def enumerate(self): return L(enumerate(self))
+    def val2idx(self): return {v:k for k,v in self.enumerate()}
+    def itemgot(self, *idxs):
+        x = self
+        for idx in idxs: x = x.map(itemgetter(idx))
+        return x
+
+    def attrgot(self, k, default=None): return self.map(lambda o:getattr(o,k,default))
+    def cycle(self): return cycle(self)
+    def map_dict(self, f=noop, *args, **kwargs): return {k:f(k, *args,**kwargs) for k in self}
+    def starmap(self, f, *args, **kwargs): return self._new(itertools.starmap(partial(f,*args,**kwargs), self))
+    def zip(self, cycled=False): return self._new((zip_cycle if cycled else zip)(*self))
+    def zipwith(self, *rest, cycled=False): return self._new([self, *rest]).zip(cycled=cycled)
+    def map_zip(self, f, *args, cycled=False, **kwargs): return self.zip(cycled=cycled).starmap(f, *args, **kwargs)
+    def map_zipwith(self, f, *rest, cycled=False, **kwargs): return self.zipwith(*rest, cycled=cycled).starmap(f, **kwargs)
+    def concat(self): return self._new(itertools.chain.from_iterable(self.map(L)))
+    def shuffle(self):
+        it = copy(self.items)
+        random.shuffle(it)
+        return self._new(it)
+
+    def append(self,o): return self.items.append(o)
+    def remove(self,o): return self.items.remove(o)
+    def count (self,o): return self.items.count(o)
+    def reverse(self ): return self.items.reverse()
+    def pop(self,o=-1): return self.items.pop(o)
+    def clear(self   ): return self.items.clear()
+    def index(self, value, start=0, stop=sys.maxsize): return self.items.index(value, start=start, stop=stop)
+    def sort(self, key=None, reverse=False): return self.items.sort(key=key, reverse=reverse)
+    def reduce(self, f, initial=None): return reduce(f, self) if initial is None else reduce(f, self, initial)
+    def sum(self): return self.reduce(operator.add)
+    def product(self): return self.reduce(operator.mul)
 
 class ListContainer:
     """A more useful form of python list, internal items are placed
@@ -126,6 +376,14 @@ class ListContainer:
         if len(self)>10: res = res[:-1] + '...]'
         return res
 
+    def _new(self, items):
+        return type(self)(items)
+
+    def map(self, f, *args, **kwargs):
+        g = (bind(f,*args,**kwargs) if callable(f)
+             else f.format if isinstance(f,str)
+             else f.__getitem__)
+        return self._new(map(g, self))
 
 class ItemList(ListContainer):
     """Class that holds a list of items with wrappers to transfrom the items

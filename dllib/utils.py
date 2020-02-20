@@ -1,6 +1,7 @@
 import math
 import torch
 import random
+import numpy as np
 import os, mimetypes, re
 from typing import Iterable, Any
 from pathlib import Path
@@ -10,15 +11,27 @@ from collections import OrderedDict
 _camel_re1 = re.compile('(.)([A-Z][a-z]+)')
 _camel_re2 = re.compile('([a-z0-9])([A-Z])')
 
+def range_of(x):
+    "All indices of collection `x` (i.e. `list(range(len(x)))`)"
+    return list(range(len(x)))
 
 def accuracy(out, yb):
     return (torch.argmax(out, dim=1)==yb).float().mean()
 
+def merge(*ds):
+    "Merge all dictionaries in `ds`"
+    return {k:v for d in ds if d is not None for k,v in d.items()}
 
 def camel2snake(name):
     s1 = re.sub(_camel_re1, r'\1_\2', name)
     return re.sub(_camel_re2, r'\1_\2', s1).lower()
 
+def even_mults(start, stop, n):
+    "Build log-stepped array from `start` to `stop` in `n` steps."
+    if n==1: return stop
+    mult = stop/start
+    step = mult**(1/(n-1))
+    return np.array([start*(step**i) for i in range(n)])
 
 def listify(obj):
     """Create list of obj by checking type and chaninging to list

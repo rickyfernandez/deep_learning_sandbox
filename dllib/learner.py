@@ -4,16 +4,17 @@ from torch import tensor
 from functools import partial
 
 from .utils import listify
-from .optimization.optimizer import SgdOptimizer
+from .optimization.optimizer import SGD
 from .callbacks import TrainEvalCallback, CancelTrainException, CancelEpochException, CancelBatchException
 
-def param_getter(m): return m.parameters()
+def param_getter(m):
+    return [p for p in m.parameters() if p.requires_grad]
 
 class Learner:
     """
     Class that holds all components to train a model.
     """
-    def __init__(self, model, data, loss_func, opt_func=SgdOptimizer,
+    def __init__(self, model, data, loss_func, opt_func=SGD,
             lr=1e-2, splitter=param_getter, cbs=None, cb_funcs=None):
 
         self.model, self.data, self.loss_func = model, data, loss_func

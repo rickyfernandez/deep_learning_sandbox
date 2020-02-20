@@ -1,12 +1,14 @@
-from torch import nn
-import re, time, torch
-from functools import partial
+import functools
+import re, time, torch, math
 import matplotlib.pyplot as plt
-
+import torch.nn as nn
+import torch.tensor as tensor
+from functools import partial
 from fastprogress import master_bar, progress_bar
 from fastprogress.fastprogress import format_time
-from .utils import camel2snake, listify
 
+from .data import L
+from .utils import camel2snake, listify
 
 class Callback:
     _order=0
@@ -130,7 +132,8 @@ class ProgressCallback(Callback):
     def begin_validate(self): self.set_pb()
 
     def set_pb(self):
-        self.pb = progress_bar(self.data_loader, parent=self.mbar, auto_update=False)
+        #self.pb = progress_bar(self.data_loader, parent=self.mbar, auto_update=False)
+        self.pb = progress_bar(self.data_loader, parent=self.mbar)
         self.mbar.update(self.epoch)
 
 
@@ -257,7 +260,7 @@ class Recorder(Callback):
 
     def after_batch(self):
         if not self.in_train: return
-        #self.lrs.append(self.opt.hypers[-1]['lr'])
+        self.lrs.append(self.opt.hypers[-1]['lr'])
         self.losses.append(self.loss.detach().cpu())
 
     def plot_lr  (self): plt.plot(self.lrs)
@@ -269,18 +272,111 @@ class Recorder(Callback):
         plt.xscale('log')
         plt.plot(self.lrs[:n], losses[:n])
 
+def annealer(f):
+    "Decorator to make `f` return itself partially applied."
+    @functools.wraps(f)
+    def _inner(start, end): return partial(f, start, end)
+    return _inner
+
+@annealer
+def SchedLin(start, end, pos):
+    "Linear schedule function from `start` to `end`"
+    return start + pos*(end-start)
+
+@annealer
+def SchedCos(start, end, pos): 
+    "Cosine schedule function from `start` to `end`"
+    return start + (1 + math.cos(math.pi*(1-pos))) * (end-start)/2
+
+@annealer
+def SchedNo(start, end, pos):
+    "Constant schedule function with `start` value"
+    return start
+
+@annealer
+def SchedExp(start, end, pos):
+    "Exponential schedule function from `start` to `end`"
+    return start * (end/start)**pos
+
+def SchedPoly(start, end, power):
+    "Polynomial schedule (of `power`) function from `start` to `end`"
+    def _inner(pos): return start + (end - start) * pos ** power
+    return _inner
+
+def combine_scheds(pcts, scheds):
+    "Combine `scheds` according to `pcts` in one function"
+    assert sum(pcts) == 1.
+    pcts = tensor([0] + L(pcts))
+    assert torch.all(pcts >= 0)
+    pcts = torch.cumsum(pcts, 0)
+    def _inner(pos):
+        if pos == 1.: return scheds[-1](1.)
+        idx = (pos >= pcts).nonzero().max()
+        actual_pos = (pos-pcts[idx]) / (pcts[idx+1]-pcts[idx])
+        return scheds[idx](actual_pos.item())
+    return _inner
+
+def combined_cos(pct, start, middle, end):
+    "Return a scheduler with cosine annealing from `start`->`middle` & `middle` -> `end`."
+    return combine_scheds([pct, 1-pct], [SchedCos(start, middle), SchedCos(middle, end)])
+
 #class ParamScheduler(Callback):
-#    _order=1
-#    def __init__(self, pname, sched_funcs):
-#        self.pname, self.sched_funcs = pname, listify(sched_funcs)
+#    "Schedule hyper-parameters according to `scheds`."
+#    run_after, run_valid = TrainEvalCallback, False
+#
+#    def __init__(self, scheds):
+#        "Scheds is a dictionary with hyper-parameter name and value sched."
+#        self.scheds = scheds
+#
+#    def begin_fit(self):
+#        "Initialize container for hyper-parameters."
+#        self.hps = {p:[] for p in self.scheds.keys()}
 #
 #    def begin_batch(self):
-#        if not self.in_train: return
-#        fs = self.sched_funcs
-#        if len(fs)==1: fs = fs*len(self.opt.param_groups)
-#        pos = self.n_epochs/self.epochs
-#        for f, h in zip(fs,self.opt.hypers): h[self.pname] = f(pos)
+#        "Set the proper hyper-parameters in the optimizer."
+#        self._update_val(self.pct_train)
 #
+#    def _update_val(self, pct):
+#        "Update each hyper-parameter by percent of epoch"
+#        for n,f in self.sched.keys(): self.set_hyper(n, f(pct))
+#
+#    def after_batch(self):
+#        "Record hyper-parameters of this batch."
+#        for p in self.scheds.keys(): self.hps[p].append(self.opt.hypers[-1][p])
+#
+#    def after_fit(self):
+#        "Save the hyper-parameters in the recorder if there is one."
+#        if hasattr(self.learn, 'recorder'): self.recorder.hps = self.hps
+
+
+
+class ParamSchedulerCallback(Callback):
+    "Class to dynamically modify hyper-parameters"
+    _order=1
+    def __init__(self, sched_dict):
+        "Input is key=hyper-value and value=sched."
+        self.sched_funcs = sched_dict
+
+    def begin_fit(self):
+        "Create record of dynamic hyper-parameters and set to learner."
+        self.hypers = {hyp_nam:[] for hyp_nam in self.sched_funcs.keys()}
+
+    def begin_batch(self):
+        if not self.in_train: return
+        for hyp_nam, func in self.sched_funcs.items():
+            self.opt.set_hyper(hyp_nam, func(self.n_epochs/self.epochs))
+
+    def after_batch(self):
+        "Record hyper-parameter values."
+        if not self.in_train: return
+        for hyp_nam in self.sched_funcs.keys():
+            self.hypers[hyp_nam].append(self.opt.hypers[-1][hyp_nam])
+
+    def after_fit(self):
+        if hasattr(self.run, 'recorder'):
+            self.recorder.hypers = self.hypers
+
+
 #class LR_Find(Callback):
 #    _order=1
 #    def __init__(self, max_iter=100, min_lr=1e-6, max_lr=10):
