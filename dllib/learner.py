@@ -21,6 +21,7 @@ class Learner:
         self.opt_func, self.lr, self.splitter = opt_func, lr, splitter
         self.in_train, self.logger, self.opt = False, print, None
 
+        self.i_mb = 0
         self.epoch, self.data_loader = None, None
         self.iter, self.xb, self.yb = None, None, None
         self.pred, self.loss, self.train = None, None, None
@@ -68,6 +69,8 @@ class Learner:
         try:
             for i, (xb,yb) in enumerate(self.data_loader):
                 self.one_batch(i, xb, yb)
+
+            if self.in_train: self.i_mb += 1
         except CancelEpochException: self("after_cancel_epoch")
 
     def do_begin_fit(self, epochs):
@@ -78,7 +81,7 @@ class Learner:
     def do_begin_epoch(self, epoch):
         """First call before begin epoch called"""
         self.epoch, self.data_loader = epoch, self.data.train_dl
-        #return self("begin_epoch")
+        return self("begin_epoch")
 
     def fit(self, epochs, cbs=None, reset_opt=False):
         """Fit model on data"""
