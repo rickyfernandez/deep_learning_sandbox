@@ -1,18 +1,24 @@
-import functools
-import re, time, torch, math
-import matplotlib.pyplot as plt
+import numpy as np
 import torch.nn as nn
 import torch.tensor as tensor
+import matplotlib.pyplot as plt
+import re, time, torch, math, types, functools
+
 from functools import partial
+from collections import defaultdict
 from fastprogress import master_bar, progress_bar
 from fastprogress.fastprogress import format_time
 
 from .data import L
-from .utils import camel2snake, listify
+from .utils import\
+        camel2snake,\
+        listify,\
+        _is_instance,\
+        _is_first,\
+        sort_by_run
 
 class Callback:
-    _order=0
-
+    run_before, run_after, toward_end = None, None, None
     def set_learner(self, run):
         self.run = run
 
@@ -60,64 +66,121 @@ class CancelEpochException(Exception): pass
 class CancelBatchException(Exception): pass
 
 
-class AvgStats:
-    """
-    Class to hold Statistics of list of metrics. We hold total cumulative statistics
-    and counts separatley to have consits metrics. Metrics should be defined per
-    batch and this class will multiply out batch count. Values are only kept per
-    mini-batch and the discarded for next batch."""
-    def __init__(self, metrics, in_train):
-        self.metrics, self.in_train = listify(metrics), in_train
+class Metric:
+    def __init__(self): self.reset()
+    def reset(self):
+        self.total, self.count = 0., 0
+
+    def __call__(self, learn, **kwargs): pass
+
+    @property
+    def name(self): return "metric"
+    @property
+    def value(self): return self.total/self.count
+
+class AvgLoss(Metric):
+    def __call__(self, learn, **kwargs):
+        bs = learn.xb.shape[0]
+        self.count += bs
+        self.total += learn.loss.detach().cpu()*bs 
+
+    @property
+    def name(self): return "loss"
+
+class AvgSmoothedLoss(Metric):
+    def __init__(self, beta=0.98, ignore_reset=True):
+        self.beta = beta
+        self.ignore_reset = ignore_reset
+        self.total, self.count = torch.tensor(0.), 0
 
     def reset(self):
-        self.tot_loss, self.count = 0.,0
-        self.tot_mets = [0.]*len(self.metrics)
+        if self.ignore_reset: return
+        self.total, self.count = torch.tensor(0.), 0
+
+    def __call__(self, learn, **kwargs):
+        self.count += 1
+        self.total = torch.lerp(learn.loss.detach().cpu(), self.total, self.beta)
 
     @property
-    def all_stats(self): return [self.tot_loss.item()] + self.tot_mets
+    def name(self): return "smooth_loss"
+    @property
+    def value(self): return self.total/(1-self.beta**self.count)
+
+class AvgMetric(Metric):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+
+    def __call__(self, learn, **kwargs):
+        bs = run.xb.shape[0]
+        self.count += bs
+        self.total += self.func(learn.pred, learn.yb)*bs
 
     @property
-    def avg_stats(self): return [o/self.count for o in self.all_stats]
+    def name(self): return self.func.__name__
 
-    def __repr__(self):
-        if not self.count: return ""
-        return f"{'train' if self.in_train else 'valid'}: {self.avg_stats}"
 
-    def accumulate(self, run):
-        bn = run.xb.shape[0]
-        self.tot_loss += run.loss * bn
-        self.count += bn
-        for i,m in enumerate(self.metrics):
-            self.tot_mets[i] += m(run.pred, run.yb) * bn
+class Recorder(Callback):
+    run_after = TrainEvalCallback
+    def begin_fit(self):
+        self.train_records = defaultdict(list)
+        self.valid_records = defaultdict(list)
+        self.train_records["lr"]
+        self.epoch_iters = []
 
+    def after_batch(self):
+        if self.in_train:
+            self.train_records["lr"].append(self.opt.hypers[-1]['lr'])
+            if hasattr(self, "avg_stats") and self.in_train:
+                for metric in self.avg_stats.train_metrics:
+                    self.train_records[metric.name].append(metric.value)
+
+    def after_epoch(self):
+        if hasattr(self, "avg_stats") and not self.in_train:
+            for metric in self.avg_stats.valid_metrics:
+                self.valid_records[metric.name].append(metric.value)
+            self.epoch_iters.append(self.n_iter)
+                
+    def plot_loss(self, skip_start=5, with_valid=True, log_xaxes=False):
+        losses = self.train_records["smooth_loss"]
+        plt.plot(np.linspace(skip_start, self.n_iter, len(losses)),
+            losses, label="Train Smoothed")
+        if with_valid:
+            losses = self.valid_records["loss"]
+            plt.plot(self.epoch_iters, losses, label="Valid")
+        if log_xaxes: plt.xscale('log')
+        plt.legend()
 
 class AvgStatsCallback(Callback):
-    def __init__(self, metrics):
-        self.train_stats = AvgStats(metrics, True)
-        self.valid_stats = AvgStats(metrics, False)
+    run_before, run_after = Recorder, TrainEvalCallback
+    def __init__(self, train_metrics=[], valid_metrics=[]):
+        self.train_metrics = L(AvgLoss(), AvgSmoothedLoss()) + train_metrics
+        self.valid_metrics = L(AvgLoss(), AvgSmoothedLoss()) + valid_metrics
 
     def begin_fit(self):
-        met_names = ["loss"] + [m.__name__ for m in self.train_stats.metrics]
-        names = ["epoch"] + [f"train_{n}" for n in met_names] + [
-            f"valid_{n}" for n in met_names] + ["time"]
+        names = L("epoch") +\
+                self.train_metrics.attrgot("name").map("train_{}") +\
+                self.valid_metrics.attrgot("name").map("valid_{}")
         self.logger(names)
 
     def begin_epoch(self):
-        self.train_stats.reset()
-        self.valid_stats.reset()
+        for metrics in [self.train_metrics, self.valid_metrics]:
+            for metric in metrics: metric.reset()
         self.start_time = time.time()
 
     def after_loss(self):
-        stats = self.train_stats if self.in_train else self.valid_stats
-        with torch.no_grad(): stats.accumulate(self.run)
+        metrics = self.train_metrics if self.in_train else self.valid_metrics
+        with torch.no_grad():
+            for metric in metrics:
+                metric(self.run)
 
     def after_epoch(self):
         stats = [str(self.epoch)]
-        for o in [self.train_stats, self.valid_stats]:
-            stats += [f"{v:.6f}" for v in o.avg_stats]
+        for o in [self.train_metrics, self.valid_metrics]:
+            for m in o: 
+                stats += [f"{m.value:.6f}"]
         stats += [format_time(time.time() - self.start_time)]
         self.logger(stats)
-
 
 class ProgressCallback(Callback):
     _order=-1
@@ -203,75 +266,6 @@ def append_stats(hook, mod, inp, outp):
     stds.append(outp.data.std().cpu())
 
 
-#class ParamScheduler(Callback):
-#    _order = 1s
-#    def __init__(self, pname, sched_funcs):
-#        self.pname, self.sched_funcs, = pname, sched_funcs
-#
-#    def begin_fit(self):
-#        if not isinstance(self.sched_funcs, (list, tuple)):
-#            self.sched_funcs = [self.sched_funcs] * len(self.opt.param_groups)
-#
-#    def set_param(self):
-#        assert len(self.opt.param_groups) == len(self.sched_funcs)
-#        for pg, f in zip(self.opt.param_groups, self.sched_funcs):
-#            pg[self.pname] = f(self.n_epochs/self.epochs)
-#
-#    def begin_batch(self):
-#        if self.in_train: self.set_param()
-#
-#def annealer(f):
-#    def _inner(start, end):
-#        return partial(f, start, end)
-#    return _inner
-#
-#@annealer
-#def sched_lin(start, end, pos):
-#    return start + pos*(end-start)
-#
-#@annealer
-#def sched_cos(start, end, pos):
-#    return start + (1 + math.cos(math.pi*(1-pos)))*(end-start)/2
-#
-#@annealer
-#def sched_no(start, end, pos):
-#    return start
-#
-#@annealer
-#def sched_exp(start, end, pos):
-#    return start * (end/start) ** pos
-#
-#def combine_scheds(pcts, scheds):
-#    assert sum(pcts) == 1.
-#    pcts = tensor([0] + listify(pcts))
-#    assert torch.all(pcts >= 0)
-#    pcts = torch.cumsum(pcts, 0)
-#    def _inner(pos):
-#        idx = (pos >= pcts).nonzero().max()
-#        actual_pos = (pos-pcts[idx])/(pcts[idx+1]-pcts[idx])
-#        return scheds[idx](actual_pos)
-#    return _inner
-#
-#def cos_1cycle_anneal(start, high, end):
-#    return [sched_cos(start, high), sched_cos(high, end)]
-#
-class Recorder(Callback):
-    def begin_fit(self): self.lrs, self.losses = [], []
-
-    def after_batch(self):
-        if not self.in_train: return
-        self.lrs.append(self.opt.hypers[-1]['lr'])
-        self.losses.append(self.loss.detach().cpu())
-
-    def plot_lr  (self): plt.plot(self.lrs)
-    def plot_loss(self): plt.plot(self.losses)
-
-    def plot(self, skip_last=0):
-        losses = [o.item() for o in self.losses]
-        n = len(losses)-skip_last
-        plt.xscale('log')
-        plt.plot(self.lrs[:n], losses[:n])
-
 def annealer(f):
     "Decorator to make `f` return itself partially applied."
     @functools.wraps(f)
@@ -320,39 +314,10 @@ def combined_cos(pct, start, middle, end):
     "Return a scheduler with cosine annealing from `start`->`middle` & `middle` -> `end`."
     return combine_scheds([pct, 1-pct], [SchedCos(start, middle), SchedCos(middle, end)])
 
-#class ParamScheduler(Callback):
-#    "Schedule hyper-parameters according to `scheds`."
-#    run_after, run_valid = TrainEvalCallback, False
-#
-#    def __init__(self, scheds):
-#        "Scheds is a dictionary with hyper-parameter name and value sched."
-#        self.scheds = scheds
-#
-#    def begin_fit(self):
-#        "Initialize container for hyper-parameters."
-#        self.hps = {p:[] for p in self.scheds.keys()}
-#
-#    def begin_batch(self):
-#        "Set the proper hyper-parameters in the optimizer."
-#        self._update_val(self.pct_train)
-#
-#    def _update_val(self, pct):
-#        "Update each hyper-parameter by percent of epoch"
-#        for n,f in self.sched.keys(): self.set_hyper(n, f(pct))
-#
-#    def after_batch(self):
-#        "Record hyper-parameters of this batch."
-#        for p in self.scheds.keys(): self.hps[p].append(self.opt.hypers[-1][p])
-#
-#    def after_fit(self):
-#        "Save the hyper-parameters in the recorder if there is one."
-#        if hasattr(self.learn, 'recorder'): self.recorder.hps = self.hps
-
-
 
 class ParamSchedulerCallback(Callback):
     "Class to dynamically modify hyper-parameters"
-    _order=1
+    run_after = TrainEvalCallback
     def __init__(self, sched_dict):
         "Input is key=hyper-value and value=sched."
         self.sched_funcs = sched_dict
@@ -377,19 +342,41 @@ class ParamSchedulerCallback(Callback):
             self.recorder.hypers = self.hypers
 
 
-#class LR_Find(Callback):
-#    _order=1
-#    def __init__(self, max_iter=100, min_lr=1e-6, max_lr=10):
-#        self.max_iter,self.min_lr,self.max_lr = max_iter,min_lr,max_lr
-#        self.best_loss = 1e9
-#
-#    def begin_batch(self):
-#        if not self.in_train: return
-#        pos = self.n_iter/self.max_iter
-#        lr = self.min_lr * (self.max_lr/self.min_lr) ** pos
-#        for pg in self.opt.hypers: pg['lr'] = lr
-#
-#    def after_step(self):
-#        if self.n_iter>=self.max_iter or self.loss>self.best_loss*10:
-#            raise CancelTrainException()
-#        if self.loss < self.best_loss: self.best_loss = self.loss
+class LRFind(ParamSchedulerCallback):
+    run_after=Recorder
+    def __init__(self, max_iter=100, min_lr=1e-7, max_lr=10, factor=4, stop_div=True):
+        self.factor = factor
+        self.max_iter, self.stop_div = max_iter, stop_div
+        self.sched_funcs = {'lr': SchedExp(min_lr, max_lr)}
+
+    def begin_fit(self):
+        super().begin_fit()
+        self.best_loss = float('inf')
+
+    def begin_batch(self):
+        if not self.in_train: return
+        for hyp_nam, func in self.sched_funcs.items():
+            self.opt.set_hyper(hyp_nam, func(self.n_iter/self.max_iter))
+
+    def after_batch(self):
+        super().after_batch()
+        loss = self.recorder.train_records["smooth_loss"][-1]
+        if loss < self.best_loss: self.best_loss = loss
+        if loss > self.factor*self.best_loss and self.stop_div: raise CancelTrainException()
+        if self.n_iter >= self.max_iter: raise CancelTrainException()
+
+    def plot_loss(self, train_loss=False, log_xaxes=True):
+        lrs = self.hypers["lr"]
+        fig, ax = plt.subplots(1,1)
+
+        losses = self.recorder.train_records["smooth_loss"]
+        ax.plot(lrs, losses, label="Train Loss Smoothed")
+        ax.set_xlabel("Learning Rate"); ax.set_ylabel("Loss")
+        if log_xaxes: ax.set_xscale('log')
+        if train_loss:
+            losses = self.recorder.train_records["loss"]
+            ax.plot(lrs, losses, label="Train Loss")
+        ax.legend()
+
+    def after_cancel_train(self):
+        pass
