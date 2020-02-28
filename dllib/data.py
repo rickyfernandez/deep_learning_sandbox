@@ -35,7 +35,7 @@ class Dataset:
 
 
 def get_dls(train_ds, valid_ds, bs, **kwargs):
-    return (DataLoader(train_ds, batch_size=bs, shuffle=True, **kwargs),
+    return (DataLoader(train_ds, batch_size=bs, shuffle=False, **kwargs),
             DataLoader(valid_ds, batch_size=bs*2, **kwargs))
 
 class DataBunch:
