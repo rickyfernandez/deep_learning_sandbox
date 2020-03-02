@@ -82,7 +82,7 @@ class AvgLoss(Metric):
     def __call__(self, learn, **kwargs):
         bs = learn.xb.shape[0]
         self.count += bs
-        self.total += learn.loss.detach().cpu()*bs 
+        self.total += learn.loss.detach().cpu()*bs
 
     @property
     def name(self): return "loss"
@@ -119,28 +119,85 @@ class AvgMetric(Metric):
     @property
     def name(self): return self.func.__name__
 
+class AvgStatsCallback(Callback):
+    def after_epoch(self):
+        stats = [str(self.epoch)]
+        for o in [self.train_metrics, self.valid_metrics]:
+            for m in o:
+                stats += [f"{m.value:.6f}"]
+        stats += [format_time(time.time() - self.start_time)]
+        self.logger(stats)
+
 
 class Recorder(Callback):
     run_after = TrainEvalCallback
+
+    def __init__(self, add_time=True, train_metrics=False, valid_metrics=True, beta=0.98):
+        self.add_time = add_time
+        self.train_metrics = train_metrics
+        self.valid_metrics = valid_metrics
+
+        self.valid_loss = AvgLoss()
+        self.train_smooth_loss = AvgSmoothedLoss(beta=beta)
+
+        self.epoch_iters, self.log= None, None
+        self.names, self.metric_names = None, None
+        self.train_losses, self.valid_losses = None, None
+
     def begin_fit(self):
-        self.train_records = defaultdict(list)
-        self.valid_records = defaultdict(list)
-        self.train_records["lr"]
         self.epoch_iters = []
+        self.lrs, self.values = [],[]
+        self.train_losses, self.valid_losses = [],[]
+
+        names = self.metrics.attrgot('name')
+        if self.train_metrics and self.valid_metrics:
+            names = L('loss') + names
+            names = names.map('train_{}') + names.map('valid_{}')
+        elif self.valid_metrics: names = L('train_loss', 'valid_loss') + names
+        else: names = L('train_loss') + names
+        if self.add_time: names.append('time')
+        self.metric_names = 'epoch' + names
+        self.train_smooth_loss.reset()
+        self.logger(self.metric_names)
+
+    def begin_epoch(self):
+        if self.in_train: for metric in self._train_metrics: metric.reset()
+        else: for metric in self._valid_metrics: metric.reset()
+        self.start_time = time.time()
+        self.log = L(self.epoch)
 
     def after_batch(self):
         if self.in_train:
-            self.train_records["lr"].append(self.opt.hypers[-1]['lr'])
-            if hasattr(self, "avg_stats") and self.in_train:
-                for metric in self.avg_stats.train_metrics:
-                    self.train_records[metric.name].append(metric.value)
+            for metric in self._train_metrics: metric(self.run)
+        else:
+            with torch.no_grad():
+                for metric in self._valid_metrics: metric(self.run)
+
+        if not self.in_train: return
+        self.lrs.append(self.opt.hypers[-1]['lr'])
+        self.train_losses.append(self.train_smooth_loss.value)
 
     def after_epoch(self):
-        if hasattr(self, "avg_stats") and not self.in_train:
-            for metric in self.avg_stats.valid_metrics:
-                self.valid_records[metric.name].append(metric.value)
+        metrics = self._train_metrics if self.in_train else self._valid_metrics
+        self.log += metrics.map(lambda o: o.value)
+
+        if self.in_train:
             self.epoch_iters.append(self.n_iter)
-                
+            return
+
+        self.run.final_record = self.log[1:].copy()
+        self.values.append(self.learn.final_record)
+        if self.add_time: self.log.append(time.time() - self.start_time)
+        self.logger(self.log)
+
+    @property
+    def _train_metrics(self):
+        return L(self.train_smooth_loss.value) + (self.metrics if self.train_metrics else L())
+
+    @property
+    def _valid_metrics(self):
+        return L(self.valid_loss.value) + (self.metrics if self.valid_metrics else L())
+
     def plot_loss(self, skip_start=5, with_valid=True, log_xaxes=False):
         losses = self.train_records["smooth_loss"]
         plt.plot(np.linspace(skip_start, self.n_iter, len(losses)),
@@ -150,37 +207,6 @@ class Recorder(Callback):
             plt.plot(self.epoch_iters, losses, label="Valid")
         if log_xaxes: plt.xscale('log')
         plt.legend()
-
-class AvgStatsCallback(Callback):
-    run_before, run_after = Recorder, TrainEvalCallback
-    def __init__(self, train_metrics=[], valid_metrics=[]):
-        self.train_metrics = L(AvgLoss(), AvgSmoothedLoss()) + train_metrics
-        self.valid_metrics = L(AvgLoss(), AvgSmoothedLoss()) + valid_metrics
-
-    def begin_fit(self):
-        names = L("epoch") +\
-                self.train_metrics.attrgot("name").map("train_{}") +\
-                self.valid_metrics.attrgot("name").map("valid_{}")
-        self.logger(names)
-
-    def begin_epoch(self):
-        for metrics in [self.train_metrics, self.valid_metrics]:
-            for metric in metrics: metric.reset()
-        self.start_time = time.time()
-
-    def after_loss(self):
-        metrics = self.train_metrics if self.in_train else self.valid_metrics
-        with torch.no_grad():
-            for metric in metrics:
-                metric(self.run)
-
-    def after_epoch(self):
-        stats = [str(self.epoch)]
-        for o in [self.train_metrics, self.valid_metrics]:
-            for m in o: 
-                stats += [f"{m.value:.6f}"]
-        stats += [format_time(time.time() - self.start_time)]
-        self.logger(stats)
 
 class ProgressCallback(Callback):
     _order=-1
