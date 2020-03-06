@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
 from .processor import Processor
 from .utils import uniqueify, listify, compose
 
+
 def normalize(x, m, s):
     return (x-m)/s
 
@@ -36,7 +37,7 @@ class Dataset:
 
 def get_dls(train_ds, valid_ds, bs, **kwargs):
     return (DataLoader(train_ds, batch_size=bs, shuffle=False, **kwargs),
-            DataLoader(valid_ds, batch_size=bs*2, **kwargs))
+            DataLoader(valid_ds, batch_size=bs, shuffle=False, **kwargs))
 
 class DataBunch:
     def __init__(self, train_dl, valid_dl, c=None):

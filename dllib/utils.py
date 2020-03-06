@@ -7,7 +7,6 @@ from typing import Iterable, Any
 from pathlib import Path
 from collections import OrderedDict
 
-from .data import L
 
 
 _camel_re1 = re.compile('(.)([A-Z][a-z]+)')
@@ -95,39 +94,8 @@ def get_files(path, extensions=None, recurse=False, include=None):
         filenames = [o.name for o in os.scandir(path) if o.is_file()]
         return _get_files(path, filenames, extensions)
 
-def _is_instance(f, gs):
-    "Check if f is instance or equal to any object in g"
-    tst = [g if type(g) in [type, 'function'] else g.__class__ for g in gs]
-    for g in tst:
-        if isinstance(f, g) or f == g:
-            return True
-
-def _is_first(f, gs):
-    "Check if f comes before all other objects in gs"
-    for o in L(getattr(f, 'run_after', None)):
-        if _is_instance(o, gs): return False
-    for g in gs:
-        if _is_instance(f, L(getattr(g, 'run_before', None))):
-            return False
-    # okay to be first
-    return True
-
-def sort_by_run(fs):
-    end = L(fs).attrgot('toward_end')
-    inp, res = L(fs)[~end] + L(fs)[end], L()
-    while len(inp):
-        for i,o in enumerate(inp):
-            if _is_first(o, inp):
-                res.append(inp.pop(i))
-                break
-        else: raise Exception("Impossible to sort")
-    return res
 
 def prev_pow_2(x): return 2**math.floor(math.log2(x))
-
-
-
-
 
 
 def model_summary(run, learn, data, find_all=False):

@@ -12,10 +12,35 @@ from fastprogress.fastprogress import format_time
 from .data import L
 from .utils import\
         camel2snake,\
-        listify,\
-        _is_instance,\
-        _is_first,\
-        sort_by_run
+        listify
+
+def _is_instance(f, gs):
+    "Check if f is instance or equal to any object in g"
+    tst = [g if type(g) in [type, 'function'] else g.__class__ for g in gs]
+    for g in tst:
+        if isinstance(f, g) or f == g:
+            return True
+
+def _is_first(f, gs):
+    "Check if f comes before all other objects in gs"
+    for o in L(getattr(f, 'run_after', None)):
+        if _is_instance(o, gs): return False
+    for g in gs:
+        if _is_instance(f, L(getattr(g, 'run_before', None))):
+            return False
+    # okay to be first
+    return True
+
+def sort_by_run(fs):
+    end = L(fs).attrgot('toward_end')
+    inp, res = L(fs)[~end] + L(fs)[end], L()
+    while len(inp):
+        for i,o in enumerate(inp):
+            if _is_first(o, inp):
+                res.append(inp.pop(i))
+                break
+        else: raise Exception("Impossible to sort")
+    return res
 
 class Callback:
     run_before, run_after, toward_end = None, None, None
@@ -45,20 +70,22 @@ class TrainEvalCallback(Callback):
         self.run.n_epochs=0.
         self.run.n_iter=0
 
+    def begin_epoch(self):
+        self.run.n_epochs = self.epoch
+
+    def before_train(self):
+        self.model.train()
+        self.run.in_train=True
+
+    def before_validate(self):
+        self.model.eval()
+        self.run.in_train=False
+
     def after_batch(self):
         """Aggreate iterations and epochs."""
         if not self.in_train: return
         self.run.n_epochs += 1./self.iters
         self.run.n_iter += 1
-
-    def begin_epoch(self):
-        self.run.n_epochs = self.epoch
-        self.model.train()
-        self.run.in_train=True
-
-    def begin_validate(self):
-        self.model.eval()
-        self.run.in_train=False
 
 
 class CancelTrainException(Exception): pass
@@ -140,6 +167,7 @@ class Recorder(Callback):
         self.valid_loss = AvgLoss()
         self.train_smooth_loss = AvgSmoothedLoss(beta=beta)
 
+        self.start_time = None
         self.epoch_iters, self.log= None, None
         self.names, self.metric_names = None, None
         self.train_losses, self.valid_losses = None, None
@@ -161,55 +189,56 @@ class Recorder(Callback):
         self.logger(self.metric_names)
 
     def begin_epoch(self):
-        if self.in_train: for metric in self._train_metrics: metric.reset()
-        else: for metric in self._valid_metrics: metric.reset()
         self.start_time = time.time()
         self.log = L(self.epoch)
 
+    def before_train(self):
+        for metric in self._train_metrics: metric.reset()
+
+    def after_train(self):
+        self.log += self._train_metrics.attrgot('value')
+
+    def before_validate(self):
+        for metric in self._valid_metrics: metric.reset()
+
+    def after_validate(self):
+        self.log += self._valid_metrics.attrgot('value')
+        self.valid_losses.append(self.valid_loss.value)
+        self.epoch_iters.append(self.n_iter)
+
     def after_batch(self):
-        if self.in_train:
-            for metric in self._train_metrics: metric(self.run)
-        else:
-            with torch.no_grad():
-                for metric in self._valid_metrics: metric(self.run)
+        metrics = self._train_metrics if self.in_train else self._valid_metrics
+        for metric in metrics: metric(self.run)
 
         if not self.in_train: return
         self.lrs.append(self.opt.hypers[-1]['lr'])
         self.train_losses.append(self.train_smooth_loss.value)
 
     def after_epoch(self):
-        metrics = self._train_metrics if self.in_train else self._valid_metrics
-        self.log += metrics.map(lambda o: o.value)
-
-        if self.in_train:
-            self.epoch_iters.append(self.n_iter)
-            return
-
-        self.run.final_record = self.log[1:].copy()
-        self.values.append(self.learn.final_record)
+        self.run.final_record = self.log.copy()
+        self.values.append(self.run.final_record)
         if self.add_time: self.log.append(time.time() - self.start_time)
         self.logger(self.log)
 
     @property
     def _train_metrics(self):
-        return L(self.train_smooth_loss.value) + (self.metrics if self.train_metrics else L())
+        return L(self.train_smooth_loss) + (self.metrics if self.train_metrics else L())
 
     @property
     def _valid_metrics(self):
-        return L(self.valid_loss.value) + (self.metrics if self.valid_metrics else L())
+        return L(self.valid_loss) + (self.metrics if self.valid_metrics else L())
 
-    def plot_loss(self, skip_start=5, with_valid=True, log_xaxes=False):
-        losses = self.train_records["smooth_loss"]
-        plt.plot(np.linspace(skip_start, self.n_iter, len(losses)),
-            losses, label="Train Smoothed")
+    def plot_loss(self, skip_start=0, with_valid=True, log_xaxes=False):
+        plt.plot(np.linspace(skip_start, self.n_iter, len(self.train_losses)),
+            self.train_losses, label="Train Smoothed")
         if with_valid:
-            losses = self.valid_records["loss"]
-            plt.plot(self.epoch_iters, losses, label="Valid")
+            plt.plot(self.epoch_iters, self.valid_losses, label="Valid")
         if log_xaxes: plt.xscale('log')
         plt.legend()
 
 class ProgressCallback(Callback):
-    _order=-1
+    run_after = TrainEvalCallback
+    run_before = Recorder
     def begin_fit(self):
         self.mbar = master_bar(range(self.epochs))
         self.mbar.on_iter_begin()
@@ -386,7 +415,8 @@ class LRFind(ParamSchedulerCallback):
 
     def after_batch(self):
         super().after_batch()
-        loss = self.recorder.train_records["smooth_loss"][-1]
+        loss = self.recorder.train_losses[-1]
+        #loss = self.recorder.train_records["smooth_loss"][-1]
         if loss < self.best_loss: self.best_loss = loss
         if loss > self.factor*self.best_loss and self.stop_div: raise CancelTrainException()
         if self.n_iter >= self.max_iter: raise CancelTrainException()
@@ -395,13 +425,10 @@ class LRFind(ParamSchedulerCallback):
         lrs = self.hypers["lr"]
         fig, ax = plt.subplots(1,1)
 
-        losses = self.recorder.train_records["smooth_loss"]
-        ax.plot(lrs, losses, label="Train Loss Smoothed")
+        #losses = self.recorder.train_records["smooth_loss"]
+        ax.plot(lrs, self.recorder.train_losses, label="Train Loss Smoothed")
         ax.set_xlabel("Learning Rate"); ax.set_ylabel("Loss")
         if log_xaxes: ax.set_xscale('log')
-        if train_loss:
-            losses = self.recorder.train_records["loss"]
-            ax.plot(lrs, losses, label="Train Loss")
         ax.legend()
 
     def after_cancel_train(self):

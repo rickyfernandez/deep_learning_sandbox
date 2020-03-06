@@ -3,9 +3,10 @@ import torch
 from torch import tensor
 from functools import partial
 
+from .data import L
 from .utils import listify
 from .optimization.optimizer import SGD
-from .callbacks import TrainEvalCallback, CancelTrainException, CancelEpochException, CancelBatchException
+from .callbacks import TrainEvalCallback, CancelTrainException, CancelEpochException, CancelBatchException, sort_by_run
 
 def param_getter(m):
     return [p for p in m.parameters() if p.requires_grad]
@@ -15,7 +16,7 @@ class Learner:
     Class that holds all components to train a model.
     """
     def __init__(self, model, data, loss_func, opt_func=SGD,
-            lr=1e-2, splitter=param_getter, cbs=None, cb_funcs=None):
+            lr=1e-2, splitter=param_getter, cbs=None, cb_funcs=None, metrics=None):
 
         self.model, self.data, self.loss_func = model, data, loss_func
         self.opt_func, self.lr, self.splitter = opt_func, lr, splitter
@@ -30,6 +31,8 @@ class Learner:
         self.add_cb(TrainEvalCallback())
         self.add_cbs(cbs)
         self.add_cbs(cbf() for cbf in listify(cb_funcs))
+
+        self.metrics = L(metrics)
 
     def add_cbs(self, cbs):
         """Add list of callbacks as an attribute"""
@@ -92,14 +95,12 @@ class Learner:
         try:
             self.do_begin_fit(epochs)
             for epoch in range(epochs):
-
-                self.do_begin_epoch(epoch)
-                if not self("begin_epoch"): self.all_batches()
+                self.do_begin_epoch(epoch); self('begin_epoch')
+                self("before_train"); self.all_batches(); self("after_train")
 
                 with torch.no_grad():
                     self.data_loader = self.data.valid_dl
-                    if not self("begin_validate"): self.all_batches()
-
+                    self('before_validate'); self.all_batches(); self("after_validate")
                 self("after_epoch")
 
         except CancelTrainException: self("after_cancel_train")
@@ -109,13 +110,13 @@ class Learner:
 
     ALL_CBS = {"begin_batch", "after_pred", "after_loss", "after_backward", "after_step",
         "after_cancel_batch", "after_batch", "after_cancel_epoch", "begin_fit",
-        "begin_epoch", "begin_validate", "after_epoch",
+        "begin_epoch", "before_train", "after_train", "before_validate", "after_validate", "after_epoch",
         "after_cancel_train", "after_fit"}
 
     def __call__(self, cb_name):
         """Call every callback registered"""
         res = False
         assert cb_name in self.ALL_CBS
-        for cb in sorted(self.cbs, key=lambda x: x._order):
+        for cb in sort_by_run(self.cbs):
             res = cb(cb_name) and res
         return res
