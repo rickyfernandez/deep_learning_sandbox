@@ -1,4 +1,5 @@
-from torch import nn
+from torch import nn, tensor
+from functools import partial
 
 #class ConvLayer(nn.Sequential):
 #    def __init__(self, in_channels, out_channels, kernel_size=3, padding=None, stride=1, zero=True, **kwargs):
@@ -11,19 +12,28 @@ from torch import nn
 #        layers = [conv]
 #        super().__init__(*layers)
 
+def normalize_chan(x, mean, std):
+    return (x-mean[...,None,None])/std[...,None,None]
+
+_m = tensor([0.47, 0.48, 0.45])
+_s = tensor([0.29, 0.28, 0.30])
+norm_imagenette = partial(normalize_chan, mean=_m.cuda(), std=_s.cuda())
 def noop(x): return x
+
+act_fn = nn.ReLU(inplace=True)
 
 class Flatten(nn.Module):
     def forward(self, x): return x.view(x.size(0), -1)
 
+
 def conv(in_channels, out_channels, kernel_size=3, stride=1, bias=False):
     return nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
-            stride=stride, padding=ks//2, bias=bias)
+            stride=stride, padding=kernel_size//2, bias=bias)
 
 
 def init_cnn(m):
     if getattr(m, 'bias', None) is not None: nn.init.constant_(m.bias, 0)
-    if isinstance(m (nn.Conv2d, nn.Linear)): nn.init.kaiming_normal_(m.weight)
+    if isinstance(m, (nn.Conv2d, nn.Linear)): nn.init.kaiming_normal_(m.weight)
     for l in m.children(): init_cnn(l)
 
 def conv_layer(in_channels, out_channels, kernel_size=3, stride=1, zero_bn=False, act=True):
@@ -45,13 +55,14 @@ class ResBlock(nn.Module):
                 conv_layer(hid_channels, out_channels, 1, zero_bn=True, act=False)
         ]
         self.convs = nn.Sequential(*layers)
-        self.idconv = noop if in_channels==out_channels else conv-layer(in_channels, out_channels, 1, act=False)
-        self.pool = noop if stride==1 else nn.AvgPool2d(2, ciel_mode=True)
+        self.idconv = noop if in_channels==out_channels else conv_layer(in_channels, out_channels, 1, act=False)
+        self.pool = noop if stride==1 else nn.AvgPool2d(2, ceil_mode=True)
 
     def forward(self, x): return act_fn(self.convs(x) + self.idconv(self.pool(x)))
 
 
 class XResNet(nn.Sequential):
+    @classmethod
     def create(cls, expansion, layers, in_channels=3, out_channels=1000):
         # create stem of resnet
         num_filters = [in_channels, (in_channels+1)*8, 64, 64]
@@ -59,7 +70,7 @@ class XResNet(nn.Sequential):
                 for i in range(3)]
 
         num_filters = [64//expansion, 64, 128, 256, 512]
-        res_layers = [cls._make_layer(epxansion, num_filters[i], num_filters[i+1],
+        res_layers = [cls._make_layer(expansion, num_filters[i], num_filters[i+1],
             n_blocks=l, stride=1 if i==0 else 2)
             for i,l in enumerate(layers)]
 
@@ -76,11 +87,11 @@ class XResNet(nn.Sequential):
     @staticmethod
     def _make_layer(expansion, in_channels, out_channels, n_blocks, stride):
         return nn.Sequential(
-                *[ResBlock(expansion, in_channels if i==0 else out_channels, stride if i==0 else 1)
+                *[ResBlock(expansion, in_channels if i==0 else out_channels, out_channels, stride if i==0 else 1)
                     for i in range(n_blocks)])
 
-def xresnet18 (**kwargs(): return XResNet.create(1, [2, 2,  2, 2], **kwargs)
-def xresnet34 (**kwargs(): return XResNet.create(1, [3, 4,  6, 3], **kwargs)
-def xresnet50 (**kwargs(): return XResNet.create(4, [3, 4,  6, 3], **kwargs)
-def xresnet101(**kwargs(): return XResNet.create(4, [3, 4, 23, 3], **kwargs)
-def xresnet152(**kwargs(): return XResNet.create(4, [3, 8, 36, 3], **kwargs)
+def xresnet18 (**kwargs): return XResNet.create(1, [2, 2,  2, 2], **kwargs)
+def xresnet34 (**kwargs): return XResNet.create(1, [3, 4,  6, 3], **kwargs)
+def xresnet50 (**kwargs): return XResNet.create(4, [3, 4,  6, 3], **kwargs)
+def xresnet101(**kwargs): return XResNet.create(4, [3, 4, 23, 3], **kwargs)
+def xresnet152(**kwargs): return XResNet.create(4, [3, 8, 36, 3], **kwargs)

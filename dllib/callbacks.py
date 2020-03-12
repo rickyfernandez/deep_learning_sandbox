@@ -139,7 +139,7 @@ class AvgMetric(Metric):
         self.func = func
 
     def __call__(self, learn, **kwargs):
-        bs = run.xb.shape[0]
+        bs = learn.xb.shape[0]
         self.count += bs
         self.total += self.func(learn.pred, learn.yb)*bs
 
@@ -270,7 +270,8 @@ class CudaCallback(Callback):
 class BatchTransformCallBack(Callback):
     """Callback to perform transformations on batch using a
     transformation function."""
-    _order=2
+    run_after = TrainEvalCallback
+    run_before = Recorder
     def __init__(self, trans_func):
         self.trans_func = trans_func
 
